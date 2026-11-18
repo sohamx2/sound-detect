@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import ipaddress
 import io
 import json
 import math
@@ -13,6 +15,7 @@ import secrets
 import socket
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -28,6 +31,32 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 STATIC = ROOT / "static"
 MAX_JSON = 9_000_000
+# Peak level a typical sound produces 1 m from a sensor; tune per sensor in the dashboard.
+DEFAULT_REF_DBFS_AT_1M = -20.0
+
+
+def estimate_distance(peak_dbfs, ref_dbfs_at_1m, max_distance):
+    """Free-field inverse-distance law: level falls 6 dB per doubling of distance.
+
+    Only a rough range: real rooms add reverberation, and the true source loudness is unknown.
+    """
+    distance = 10 ** ((ref_dbfs_at_1m - peak_dbfs) / 20)
+    return round(max(0.1, min(max_distance, distance)), 2)
+
+
+def trilaterate(ranges, width, depth, step=0.05):
+    """Point in the room whose distances to the sensors best match the estimated ranges."""
+    step = max(step, max(width, depth) / 150)  # bound the search for large rooms
+    best, best_error = None, float("inf")
+    nx, ny = int(width / step) + 1, int(depth / step) + 1
+    for i in range(nx):
+        x = i * step
+        for j in range(ny):
+            y = j * step
+            error = sum((math.hypot(x - r["x"], y - r["y"]) - r["distance"]) ** 2 * r["weight"] for r in ranges)
+            if error < best_error:
+                best, best_error = (x, y), error
+    return {"x": round(best[0], 2), "y": round(best[1], 2)}
 
 
 def now_iso() -> str:
@@ -46,36 +75,144 @@ def text_value(value, limit=80):
     return str(value or "").strip()[:limit]
 
 
-def public_ip() -> str:
+def usable_lan_ip(value) -> bool:
     try:
-        output = subprocess.check_output(["/sbin/ifconfig"], text=True, stderr=subprocess.DEVNULL)
-        ips = re.findall(r"\binet (\d+\.\d+\.\d+\.\d+)", output)
-        return next((ip for ip in ips if not ip.startswith("127.")), "127.0.0.1")
-    except Exception:
-        return "127.0.0.1"
+        address = ipaddress.IPv4Address(value)
+        return not (address.is_loopback or address.is_link_local or address.is_unspecified or address.is_multicast)
+    except (ipaddress.AddressValueError, TypeError):
+        return False
 
 
-def ensure_certificate(addresses: list[str], regenerate=False):
-    cert_dir = DATA / "tls"
+def choose_lan_ip(wifi_ip=None, route_ip=None, fallback_ips=()) -> str:
+    """Prefer the active Wi-Fi address, then the routed and other local addresses."""
+    for candidate in (wifi_ip, route_ip, *fallback_ips):
+        if usable_lan_ip(candidate):
+            return str(ipaddress.IPv4Address(candidate))
+    return "127.0.0.1"
+
+
+def wifi_ipv4() -> str | None:
+    """Return the current macOS Wi-Fi interface address when one is assigned."""
+    try:
+        output = subprocess.check_output(
+            ["/usr/sbin/networksetup", "-listallhardwareports"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for block in re.split(r"\n(?=Hardware Port:)", output):
+        if not re.search(r"Hardware Port:\s*(?:Wi-Fi|AirPort)\s*$", block, re.IGNORECASE | re.MULTILINE):
+            continue
+        device = re.search(r"^Device:\s*(\S+)", block, re.MULTILINE)
+        if not device:
+            continue
+        try:
+            address = subprocess.check_output(
+                ["/usr/sbin/ipconfig", "getifaddr", device.group(1)],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            ).strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if usable_lan_ip(address):
+            return address
+    return None
+
+
+def routed_ipv4() -> str | None:
+    """Ask the kernel which IPv4 interface would carry an off-link UDP packet.
+
+    UDP connect only performs route selection; it sends no packet.
+    """
+    for destination in ("192.0.2.1", "1.1.1.1"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect((destination, 9))
+                address = probe.getsockname()[0]
+            if usable_lan_ip(address):
+                return address
+        except OSError:
+            continue
+    return None
+
+
+def interface_ipv4s() -> list[tuple[str, str]]:
+    """List usable IPv4 addresses by interface, with hardware interfaces first."""
+    try:
+        output = subprocess.check_output(
+            ["/sbin/ifconfig"], text=True, stderr=subprocess.DEVNULL, timeout=3
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for block in re.split(r"(?m)^(?=\S[^:\n]*: flags=)", output):
+        header = re.match(r"([^\s:]+):\s+flags=", block)
+        if not header:
+            continue
+        interface = header.group(1)
+        for address in re.findall(r"\binet (\d+(?:\.\d+){3})\b", block):
+            if usable_lan_ip(address):
+                found.append((interface, address))
+    found.sort(key=lambda pair: (not re.fullmatch(r"en\d+", pair[0]), pair[0]))
+    return found
+
+
+def public_ip() -> str:
+    """Return the best current local address for sensor links."""
+    wifi = wifi_ipv4()
+    if usable_lan_ip(wifi):
+        return str(ipaddress.IPv4Address(wifi))
+    route = routed_ipv4()
+    if usable_lan_ip(route):
+        return str(ipaddress.IPv4Address(route))
+    fallback = [address for _, address in interface_ipv4s()]
+    return choose_lan_ip(fallback_ips=fallback)
+
+
+def ensure_certificate(addresses: list[str], regenerate=False, cert_dir=None):
+    cert_dir = Path(cert_dir) if cert_dir else DATA / "tls"
     cert_dir.mkdir(parents=True, exist_ok=True)
     ca = cert_dir / "SoundDetect-CA.crt"
     leaf = cert_dir / "server.crt"
     key = cert_dir / "server.key"
-    if regenerate or not (ca.exists() and leaf.exists() and key.exists()):
-        ca_key = cert_dir / "ca.key"
-        csr = cert_dir / "server.csr"
-        ext = cert_dir / "server.ext"
-        names = ["DNS:localhost", "IP:127.0.0.1"] + [f"IP:{ip}" for ip in addresses if ip != "127.0.0.1"]
-        ext.write_text("basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=" + ",".join(names) + "\n")
-        commands = [
-            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes", "-days", "3650", "-subj", "/CN=SoundDetect Local CA", "-keyout", str(ca_key), "-out", str(ca), "-addext", "basicConstraints=critical,CA:TRUE"],
-            ["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=SoundDetect Mac", "-keyout", str(key), "-out", str(csr)],
-            ["openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(ca_key), "-CAcreateserial", "-out", str(leaf), "-days", "365", "-sha256", "-extfile", str(ext)],
-        ]
-        for command in commands:
-            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ca_key = cert_dir / "ca.key"
+    csr = cert_dir / "server.csr"
+    ext = cert_dir / "server.ext"
+    address_record = cert_dir / "server-addresses.txt"
+    san_addresses = sorted({"127.0.0.1", *(ip for ip in addresses if usable_lan_ip(ip))})
+    names = ["DNS:localhost"] + [f"IP:{ip}" for ip in san_addresses]
+
+    if regenerate or not (ca.exists() and ca_key.exists()):
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes", "-days", "3650",
+             "-subj", "/CN=SoundDetect Local CA", "-keyout", str(ca_key), "-out", str(ca),
+             "-addext", "basicConstraints=critical,CA:TRUE"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         os.chmod(ca_key, 0o600)
+
+    addresses_changed = not address_record.exists() or address_record.read_text().splitlines() != san_addresses
+    if regenerate or addresses_changed or not (leaf.exists() and key.exists()):
+        if regenerate or not key.exists():
+            make_key_and_csr = ["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=SoundDetect Mac",
+                                 "-keyout", str(key), "-out", str(csr)]
+        else:
+            make_key_and_csr = ["openssl", "req", "-new", "-key", str(key), "-subj", "/CN=SoundDetect Mac", "-out", str(csr)]
+        subprocess.run(make_key_and_csr, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ext.write_text(
+            "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\n"
+            "extendedKeyUsage=serverAuth\nsubjectAltName=" + ",".join(names) + "\n"
+        )
+        subprocess.run(
+            ["openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(ca_key),
+             "-CAcreateserial", "-out", str(leaf), "-days", "365", "-sha256", "-extfile", str(ext)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         os.chmod(key, 0o600)
+        address_record.write_text("\n".join(san_addresses) + "\n")
     return ca, leaf, key
 
 
@@ -103,8 +240,15 @@ class Store:
                 ],
                 "sensors": [],
                 "events": [],
+                "eventRules": [],
+                "incidents": [],
             }
             self.save()
+        self.state.setdefault("eventRules", [])
+        self.state.setdefault("incidents", [])
+        for sensor in self.state.get("sensors", []):
+            sensor.setdefault("nodeType", "mobile")
+            sensor.setdefault("refDbfsAt1m", DEFAULT_REF_DBFS_AT_1M)
 
     def save(self):
         temp = self.path.with_suffix(".tmp")
@@ -114,14 +258,174 @@ class Store:
     def sensor(self, sid):
         return next((s for s in self.state["sensors"] if s["id"] == sid), None)
 
-    def snapshot(self, base_url, classifier_status):
+    def add_sensor(self, node_type="mobile"):
+        node_type = text_value(node_type, 32) or "mobile"
+        if node_type not in ("mobile", "esp32_inmp441"):
+            raise ValueError("nodeType must be mobile or esp32_inmp441")
+        with self.lock:
+            room = self.state["room"]
+            corners = [(0.3, 0.3), (room["width"] - 0.3, 0.3),
+                       (room["width"] - 0.3, room["depth"] - 0.3), (0.3, room["depth"] - 0.3)]
+            x, y = corners[len(self.state["sensors"]) % 4]
+            number = len(self.state["sensors"]) + 1
+            node_name = "ESP32 + INMP441" if node_type == "esp32_inmp441" else "Mobile sensor"
+            sensor = {"id": uuid.uuid4().hex[:10], "token": secrets.token_urlsafe(24),
+                      "name": f"{node_name} {number:02}", "nodeType": node_type,
+                      "x": round(x, 2), "y": round(y, 2),
+                      "thresholdDbfs": -28, "refDbfsAt1m": DEFAULT_REF_DBFS_AT_1M, "watchFor": "", "lastSeen": None, "active": False}
+            self.state["sensors"].append(sensor)
+            self.save()
+            return sensor
+
+    def snapshot(self, base_url, classifier_status, network_mode="automatic"):
         with self.lock:
             data = json.loads(json.dumps(self.state))
         for sensor in data["sensors"]:
+            sensor.setdefault("nodeType", "mobile")
             sensor["pairingUrl"] = f"{base_url}/sensor?sid={sensor['id']}&token={sensor['token']}"
+        data.setdefault("eventRules", [])
+        data.setdefault("incidents", [])
+        for rule in data["eventRules"]:
+            rule.pop("createdAtEpoch", None)
         data["classifier"] = classifier_status
         data["baseUrl"] = base_url
+        data["networkMode"] = network_mode
         return data
+
+    def create_event_rule(self, payload):
+        name = text_value(payload.get("name"), 60)
+        first_match = text_value(payload.get("firstMatch"), 80)
+        second_match = text_value(payload.get("secondMatch"), 80)
+        if not name or not first_match or not second_match:
+            raise ValueError("Enter an event name and both sound-label matches")
+        scope = text_value(payload.get("scope"), 24) or "any_sensor"
+        if scope not in ("any_sensor", "same_sensor"):
+            raise ValueError("Scope must be any_sensor or same_sensor")
+        window = int(limited(payload.get("windowSeconds"), 5, 600, 60))
+        rule = {
+            "id": uuid.uuid4().hex[:10],
+            "name": name,
+            "firstMatch": first_match,
+            "secondMatch": second_match,
+            "windowSeconds": window,
+            "scope": scope,
+            "enabled": True,
+            "createdAt": now_iso(),
+            "createdAtEpoch": time.time(),
+        }
+        with self.lock:
+            self.state.setdefault("eventRules", []).append(rule)
+            self.save()
+        return {key: value for key, value in rule.items() if key != "createdAtEpoch"}
+
+    def update_event_rule(self, rule_id, payload):
+        with self.lock:
+            rule = next((item for item in self.state.setdefault("eventRules", []) if item["id"] == rule_id), None)
+            if not rule:
+                return None
+            name = text_value(payload.get("name", rule["name"]), 60)
+            first_match = text_value(payload.get("firstMatch", rule["firstMatch"]), 80)
+            second_match = text_value(payload.get("secondMatch", rule["secondMatch"]), 80)
+            if not name or not first_match or not second_match:
+                raise ValueError("Enter an event name and both sound-label matches")
+            scope = text_value(payload.get("scope", rule["scope"]), 24)
+            if scope not in ("any_sensor", "same_sensor"):
+                raise ValueError("Scope must be any_sensor or same_sensor")
+            rule.update({
+                "name": name,
+                "firstMatch": first_match,
+                "secondMatch": second_match,
+                "windowSeconds": int(limited(payload.get("windowSeconds", rule["windowSeconds"]), 5, 600, rule["windowSeconds"])),
+                "scope": scope,
+                "enabled": bool(payload.get("enabled", rule["enabled"])),
+                "createdAt": now_iso(),
+                "createdAtEpoch": time.time(),
+            })
+            self.save()
+            return {key: value for key, value in rule.items() if key != "createdAtEpoch"}
+
+    def delete_event_rule(self, rule_id):
+        with self.lock:
+            rules = self.state.setdefault("eventRules", [])
+            before = len(rules)
+            self.state["eventRules"] = [rule for rule in rules if rule["id"] != rule_id]
+            if len(self.state["eventRules"]) == before:
+                return False
+            self.save()
+            return True
+
+    @staticmethod
+    def _event_matches(event, fragment):
+        label = text_value(event.get("label"), 100).casefold()
+        return label != "analyzing…" and text_value(fragment, 80).casefold() in label
+
+    @staticmethod
+    def _event_sensors(event):
+        return {observation.get("sensorId") for observation in event.get("observations", []) if observation.get("sensorId")}
+
+    @staticmethod
+    def _incident_step(event):
+        sensor_names = sorted({observation.get("sensorName", "Sensor") for observation in event.get("observations", [])})
+        return {
+            "eventId": event["id"],
+            "label": event.get("label", "Unknown sound"),
+            "capturedAt": event.get("capturedAt"),
+            "confidence": event.get("confidence", 0),
+            "sensorNames": sensor_names,
+        }
+
+    def _evaluate_event_rules(self):
+        """Build named incidents from ordered classifier labels inside configured time windows."""
+        with self.lock:
+            self._evaluate_event_rules_locked()
+
+    def _evaluate_event_rules_locked(self):
+        events = sorted(
+            (event for event in self.state.get("events", []) if event.get("label") != "Analyzing…"),
+            key=lambda event: event.get("timestamp", 0),
+        )
+        incidents = self.state.setdefault("incidents", [])
+        existing = {(incident.get("ruleId"), incident.get("triggerEventId")) for incident in incidents}
+        for rule in self.state.get("eventRules", []):
+            if not rule.get("enabled", True):
+                continue
+            earliest = rule.get("createdAtEpoch", 0)
+            window = rule.get("windowSeconds", 60)
+            for second_index, second in enumerate(events):
+                second_time = second.get("timestamp", 0)
+                if second_time < earliest or not self._event_matches(second, rule["secondMatch"]):
+                    continue
+                if (rule["id"], second["id"]) in existing:
+                    continue
+                for first in reversed(events[:second_index]):
+                    delta = second_time - first.get("timestamp", 0)
+                    if delta > window:
+                        break
+                    if delta <= 0 or first.get("timestamp", 0) < earliest:
+                        continue
+                    if not self._event_matches(first, rule["firstMatch"]):
+                        continue
+                    if rule.get("scope") == "same_sensor" and not (self._event_sensors(first) & self._event_sensors(second)):
+                        continue
+                    incident = {
+                        "id": uuid.uuid4().hex[:12],
+                        "ruleId": rule["id"],
+                        "ruleName": rule["name"],
+                        "triggerEventId": second["id"],
+                        "sourceEventIds": [first["id"], second["id"]],
+                        "startedAt": first.get("capturedAt"),
+                        "triggeredAt": second.get("capturedAt"),
+                        "timestamp": second_time,
+                        "windowSeconds": window,
+                        "sequence": [self._incident_step(first), self._incident_step(second)],
+                        "createdAt": now_iso(),
+                    }
+                    incidents.append(incident)
+                    existing.add((rule["id"], second["id"]))
+                    break
+        incidents.sort(key=lambda incident: incident.get("timestamp", 0))
+        if len(incidents) > 300:
+            self.state["incidents"] = incidents[-300:]
 
     def add_observation(self, sensor, payload, raw):
         captured = text_value(payload.get("capturedAt"), 48)
@@ -146,9 +450,12 @@ class Store:
             (self.root / "audio" / file_name).write_bytes(raw)
             observation = {"id": obs_id, "sensorId": sensor["id"], "sensorName": sensor["name"],
                            "sensorPosition": {"x": sensor["x"], "y": sensor["y"]},
+                           "refDbfsAt1m": sensor.get("refDbfsAt1m", DEFAULT_REF_DBFS_AT_1M),
                            "capturedAt": captured, "receivedAt": now_iso(),
                            "peakDbfs": limited(payload.get("peakDbfs"), -120, 0, -120),
                            "duration": limited(payload.get("duration"), 0, 10, 0),
+                           "sampleRate": int(limited(payload.get("sampleRate"), 0, 96000, 0)),
+                           "firmware": text_value(payload.get("firmware"), 48),
                            "file": file_name, "label": "Analyzing…", "confidence": 0}
             event["observations"].append(observation)
             self._locate(event)
@@ -156,19 +463,34 @@ class Store:
             return event["id"], obs_id, self.root / "audio" / file_name
 
     def _locate(self, event):
-        observations = event["observations"]
-        distinct = {o["sensorId"]: o for o in observations}
-        items = list(distinct.values())
-        if len(items) == 1:
-            event["location"] = items[0]["sensorPosition"]
-            event["locationMethod"] = "Near reporting sensor; source location unknown"
+        room = self.state["room"]
+        diagonal = math.hypot(room["width"], room["depth"])
+        distinct = {}
+        for o in event["observations"]:
+            # Keep the loudest observation per sensor.
+            if o["sensorId"] not in distinct or o["peakDbfs"] > distinct[o["sensorId"]]["peakDbfs"]:
+                distinct[o["sensorId"]] = o
+        ranges = []
+        for o in distinct.values():
+            distance = estimate_distance(o["peakDbfs"], o.get("refDbfsAt1m", DEFAULT_REF_DBFS_AT_1M), diagonal)
+            o["estimatedDistance"] = distance
+            ranges.append({"sensorId": o["sensorId"], "sensorName": o["sensorName"],
+                           "x": o["sensorPosition"]["x"], "y": o["sensorPosition"]["y"],
+                           "distance": distance, "weight": 1 / max(distance, 0.3) ** 2})
+        event["ranges"] = [{k: v for k, v in r.items() if k != "weight"} for r in ranges]
+        if len(ranges) == 1:
+            r = ranges[0]
+            event["location"] = {"x": r["x"], "y": r["y"]}
+            event["locationMethod"] = (f"About {r['distance']:.1f} m from {r['sensorName']}; direction unknown "
+                                       "with one sensor (level-based, uncalibrated)")
+        elif len(ranges) == 2:
+            event["location"] = trilaterate(ranges, room["width"], room["depth"])
+            event["locationMethod"] = ("Approximate position from two level-based ranges; "
+                                       "a mirror position is also possible")
         else:
-            # Relative microphone levels provide only a rough estimate; phones are not calibrated.
-            weights = [max(0.001, 10 ** (o["peakDbfs"] / 20)) for o in items]
-            total = sum(weights)
-            event["location"] = {"x": round(sum(o["sensorPosition"]["x"] * w for o, w in zip(items, weights)) / total, 2),
-                                 "y": round(sum(o["sensorPosition"]["y"] * w for o, w in zip(items, weights)) / total, 2)}
-            event["locationMethod"] = "Approximate level-weighted estimate; phones are uncalibrated"
+            event["location"] = trilaterate(ranges, room["width"], room["depth"])
+            event["locationMethod"] = (f"Approximate position from {len(ranges)} level-based ranges; "
+                                       "microphones are uncalibrated")
 
     def finish_observation(self, event_id, obs_id, result):
         with self.lock:
@@ -181,10 +503,16 @@ class Store:
             observation["label"] = result["label"]
             observation["confidence"] = result["confidence"]
             observation["candidates"] = result.get("candidates", [])
-            best = max(event["observations"], key=lambda o: o.get("confidence", 0))
+            classified = [item for item in event["observations"] if item.get("label") != "Analyzing…"]
+            if not classified:
+                self.save()
+                return
+            best = max(classified, key=lambda o: o.get("confidence", 0))
             event["label"] = best["label"]
             event["confidence"] = best["confidence"]
             event["candidates"] = best.get("candidates", [])
+            if all(item.get("label") != "Analyzing…" for item in event["observations"]):
+                self._evaluate_event_rules()
             self.save()
 
 
@@ -197,6 +525,40 @@ def display_label(identifier):
     if "thump" in lower or "thud" in lower or "crash" in lower:
         return "Impact / possible fall"
     return lower.title()
+
+
+MIN_ANALYSIS_SECONDS = 3.0
+
+
+@contextlib.contextmanager
+def padded_for_analysis(path, min_seconds=MIN_ANALYSIS_SECONDS):
+    """Yield a WAV path at least min_seconds long.
+
+    Apple's sound classifier analyses fixed-length windows and can return no result at
+    all for short clips (such as the 1.2 s ESP32 uploads). Short clips are centred in
+    silence in a temporary copy; the stored recording is not changed.
+    """
+    with wave.open(str(path), "rb") as source:
+        params = source.getparams()
+        frames = source.readframes(params.nframes)
+    needed = int(min_seconds * params.framerate)
+    if params.nframes >= needed:
+        yield path
+        return
+    width = params.sampwidth * params.nchannels
+    lead = ((needed - params.nframes) // 2) * width
+    tail = needed * width - lead - len(frames)
+    handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    handle.close()
+    try:
+        with wave.open(handle.name, "wb") as target:
+            target.setnchannels(params.nchannels)
+            target.setsampwidth(params.sampwidth)
+            target.setframerate(params.framerate)
+            target.writeframes(b"\0" * lead + frames + b"\0" * tail)
+        yield Path(handle.name)
+    finally:
+        os.unlink(handle.name)
 
 
 class Classifier:
@@ -225,7 +587,8 @@ class Classifier:
         if not self.binary.exists():
             return {"label": "Unclassified", "confidence": 0, "candidates": []}
         try:
-            completed = subprocess.run([str(self.binary), str(path)], capture_output=True, text=True, timeout=35, check=True)
+            with padded_for_analysis(path) as analysis_path:
+                completed = subprocess.run([str(self.binary), str(analysis_path)], capture_output=True, text=True, timeout=35, check=True)
             candidates = json.loads(completed.stdout)
             if not candidates:
                 return {"label": "Unknown sound", "confidence": 0, "candidates": []}
@@ -257,6 +620,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_audio(self, data):
+        """Serve a WAV clip with HTTP byte-range support (Safari requires it to play media)."""
+        size = len(data)
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", (self.headers.get("Range") or "").strip())
+        if not match or (not match.group(1) and not match.group(2)):
+            return self.respond(HTTPStatus.OK, data, "audio/wav", {"Accept-Ranges": "bytes"})
+        start_text, end_text = match.groups()
+        if start_text:
+            start = int(start_text)
+            end = min(int(end_text), size - 1) if end_text else size - 1
+        else:
+            start = max(0, size - int(end_text))
+            end = size - 1
+        if start >= size or start > end:
+            return self.respond(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, b"", "audio/wav",
+                                {"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
+        return self.respond(HTTPStatus.PARTIAL_CONTENT, data[start:end + 1], "audio/wav",
+                            {"Content-Range": f"bytes {start}-{end}/{size}", "Accept-Ranges": "bytes"})
+
     def query(self):
         return parse_qs(urlparse(self.path).query)
 
@@ -280,7 +662,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             if not self.admin():
                 return self.respond(HTTPStatus.FORBIDDEN, {"error": "Invalid dashboard key"})
-            return self.respond(HTTPStatus.OK, self.server.store.snapshot(self.server.base_url, self.server.classifier.status))
+            return self.respond(HTTPStatus.OK, self.server.store.snapshot(
+                self.server.current_base_url(), self.server.classifier.status, self.server.network_mode
+            ))
         if path == "/api/sensor-config":
             sid = self.query().get("sid", [""])[0]
             sensor = self.sensor_auth(sid)
@@ -302,7 +686,7 @@ class Handler(BaseHTTPRequestHandler):
                 obs = next((o for o in event["observations"] if o["id"] == obs_id), None) if event else None
             if not obs:
                 return self.respond(HTTPStatus.NOT_FOUND, {"error": "Recording not found"})
-            return self.respond(HTTPStatus.OK, (self.server.store.root / "audio" / obs["file"]).read_bytes(), "audio/wav")
+            return self.send_audio((self.server.store.root / "audio" / obs["file"]).read_bytes())
         if path == "/api/photo":
             if not self.admin():
                 return self.respond(HTTPStatus.FORBIDDEN, {"error": "Invalid dashboard key"})
@@ -342,6 +726,7 @@ class Handler(BaseHTTPRequestHandler):
                     duration = wav.getnframes() / wav.getframerate()
                     if not 0.2 <= duration <= 10 or not 8000 <= wav.getframerate() <= 96000:
                         raise ValueError("Invalid audio duration or sample rate")
+                    payload["sampleRate"] = wav.getframerate()
                 payload["duration"] = duration
                 event_id, obs_id, file_path = self.server.store.add_observation(sensor, payload, raw)
                 threading.Thread(target=self.server.analyze, args=(event_id, obs_id, file_path), daemon=True).start()
@@ -361,16 +746,11 @@ class Handler(BaseHTTPRequestHandler):
                     store.save()
                     return self.respond(HTTPStatus.OK, room)
                 if path == "/api/sensors":
-                    room = store.state["room"]
-                    corners = [(0.3, 0.3), (room["width"] - 0.3, 0.3),
-                               (room["width"] - 0.3, room["depth"] - 0.3), (0.3, room["depth"] - 0.3)]
-                    x, y = corners[len(store.state["sensors"]) % 4]
-                    sensor = {"id": uuid.uuid4().hex[:10], "token": secrets.token_urlsafe(24),
-                              "name": f"Sensor {len(store.state['sensors']) + 1:02}", "x": round(x, 2), "y": round(y, 2),
-                              "thresholdDbfs": -28, "watchFor": "", "lastSeen": None, "active": False}
-                    store.state["sensors"].append(sensor)
-                    store.save()
+                    sensor = store.add_sensor(payload.get("nodeType", "mobile"))
                     return self.respond(HTTPStatus.CREATED, sensor)
+                if path == "/api/event-rules":
+                    rule = store.create_event_rule(payload)
+                    return self.respond(HTTPStatus.CREATED, rule)
                 if path == "/api/furniture":
                     item = {"id": uuid.uuid4().hex[:10], "type": text_value(payload.get("type"), 20),
                             "x": limited(payload.get("x"), 0, room_max(store, "width"), 1),
@@ -406,6 +786,12 @@ class Handler(BaseHTTPRequestHandler):
             payload = self.json_body()
             store = self.server.store
             with store.lock:
+                rule_match = re.fullmatch(r"/api/event-rules/([a-zA-Z0-9-]+)", path)
+                if rule_match:
+                    rule = store.update_event_rule(rule_match.group(1), payload)
+                    if not rule:
+                        return self.respond(HTTPStatus.NOT_FOUND, {"error": "Event rule not found"})
+                    return self.respond(HTTPStatus.OK, rule)
                 match = re.fullmatch(r"/api/(sensors|furniture)/([a-zA-Z0-9-]+)", path)
                 if not match:
                     return self.respond(HTTPStatus.NOT_FOUND, {"error": "Not found"})
@@ -418,6 +804,8 @@ class Handler(BaseHTTPRequestHandler):
                         item["name"] = text_value(payload["name"], 40) or item["name"]
                     if "thresholdDbfs" in payload:
                         item["thresholdDbfs"] = limited(payload["thresholdDbfs"], -60, -8, item["thresholdDbfs"])
+                    if "refDbfsAt1m" in payload:
+                        item["refDbfsAt1m"] = limited(payload["refDbfsAt1m"], -70, 0, item.get("refDbfsAt1m", DEFAULT_REF_DBFS_AT_1M))
                     if "watchFor" in payload:
                         item["watchFor"] = text_value(payload["watchFor"], 100)
                 for axis, bound in (("x", "width"), ("y", "depth")):
@@ -434,6 +822,9 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         store = self.server.store
         with store.lock:
+            rule_match = re.fullmatch(r"/api/event-rules/([a-zA-Z0-9-]+)", path)
+            if rule_match and store.delete_event_rule(rule_match.group(1)):
+                return self.respond(HTTPStatus.OK, {"deleted": rule_match.group(1)})
             match = re.fullmatch(r"/api/(sensors|furniture)/([a-zA-Z0-9-]+)", path)
             if match:
                 collection, item_id = match.groups()
@@ -452,12 +843,37 @@ def room_max(store, dimension):
 class SoundServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, store, classifier, base_url, ca_path):
+    def __init__(self, address, store, classifier, lan_ip, ca_path, cert_path, key_path, tls_context, network_mode):
         super().__init__(address, Handler)
         self.store = store
         self.classifier = classifier
-        self.base_url = base_url
+        self.lan_ip = lan_ip
+        self.port = address[1]
+        self.base_url = f"https://{lan_ip}:{self.port}"
         self.ca_path = ca_path
+        self.cert_path = cert_path
+        self.key_path = key_path
+        self.tls_context = tls_context
+        self.network_mode = network_mode
+        self.network_lock = threading.RLock()
+
+    def current_base_url(self):
+        with self.network_lock:
+            return self.base_url
+
+    def update_network_address(self, address):
+        if not usable_lan_ip(address):
+            return False
+        address = str(ipaddress.IPv4Address(address))
+        with self.network_lock:
+            if address == self.lan_ip:
+                return False
+            # Keep the trusted local CA, but issue a leaf certificate for the new Wi-Fi IP.
+            ensure_certificate([address])
+            self.tls_context.load_cert_chain(certfile=self.cert_path, keyfile=self.key_path)
+            self.lan_ip = address
+            self.base_url = f"https://{address}:{self.port}"
+            return True
 
     def analyze(self, event_id, obs_id, path):
         self.store.finish_observation(event_id, obs_id, self.classifier.classify(path))
@@ -470,24 +886,46 @@ def main():
     parser.add_argument("--regenerate-cert", action="store_true")
     args = parser.parse_args()
     lan_ip = args.ip or public_ip()
+    if args.ip and not usable_lan_ip(args.ip):
+        parser.error("--ip must be a usable IPv4 address assigned to this Mac")
     ca, cert, key = ensure_certificate([lan_ip], args.regenerate_cert)
     store = Store()
     print("Preparing Apple Sound Analysis classifier...", flush=True)
     classifier = Classifier()
-    server = SoundServer(("0.0.0.0", args.port), store, classifier, f"https://{lan_ip}:{args.port}", ca)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=cert, keyfile=key)
+    server = SoundServer(("0.0.0.0", args.port), store, classifier, lan_ip, ca, cert, key, context,
+                         "manual" if args.ip else "automatic")
     server.socket = context.wrap_socket(server.socket, server_side=True)
     print(f"Dashboard: https://localhost:{args.port}/dashboard?key={store.admin_key}", flush=True)
-    print(f"Phone address: https://{lan_ip}:{args.port}", flush=True)
+    print(f"Phone address ({server.network_mode}): https://{lan_ip}:{args.port}", flush=True)
+    if lan_ip == "127.0.0.1":
+        print("No Wi-Fi IPv4 address found yet; the phone address will appear when Wi-Fi connects.", flush=True)
     print(f"Classifier: {classifier.status}", flush=True)
     print("Keep this terminal open while sensors are connected.", flush=True)
+    stop_monitor = threading.Event()
+    if not args.ip:
+        threading.Thread(target=monitor_network_address, args=(server, stop_monitor), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        stop_monitor.set()
         server.server_close()
+
+
+def monitor_network_address(server, stop_event):
+    """Refresh pairing links and the TLS certificate when Wi-Fi changes."""
+    while not stop_event.wait(3):
+        address = public_ip()
+        if not usable_lan_ip(address) or address == server.lan_ip:
+            continue
+        try:
+            if server.update_network_address(address):
+                print(f"Wi-Fi changed; refreshed phone address: {server.base_url}", flush=True)
+        except (OSError, subprocess.SubprocessError, ssl.SSLError) as exc:
+            print(f"Could not refresh the phone address: {exc}", flush=True)
 
 
 if __name__ == "__main__":
